@@ -222,7 +222,9 @@ Future<void> _loadInstitution() async {
 
     final institutionData = await SupabaseService.client
         .from('institutions')
-        .select('name, slogan, description, logo_url')
+        .select(
+          'name, slogan, description, logo_url, country, city, address',
+        )
         .eq('id', _institutionId!)
         .maybeSingle();
 
@@ -245,6 +247,12 @@ Future<void> _loadInstitution() async {
       _descriptionController.text =
           institutionData['description']?.toString().trim() ?? '';
       _savedLogoUrl = institutionData['logo_url']?.toString().trim();
+      _countryController.text =
+          institutionData['country']?.toString().trim() ?? '';
+      _cityController.text =
+          institutionData['city']?.toString().trim() ?? '';
+      _addressController.text =
+          institutionData['address']?.toString().trim() ?? '';
     }
 
     if (mounted) {
@@ -665,6 +673,54 @@ Future<void> _loadInstitution() async {
   }
 
   // ==========================================================
+  // SAVE LOCATION
+  // ==========================================================
+
+  Future<bool> _saveLocation() async {
+    final institutionId = _institutionId;
+
+    if (institutionId == null || institutionId.isEmpty) {
+      _showLocationSaveError('Could not find your institution.');
+      return false;
+    }
+
+    try {
+      final updatedInstitution = await SupabaseService.client
+          .from('institutions')
+          .update({
+            'country': _countryController.text.trim(),
+            'city': _cityController.text.trim(),
+            'address': _addressController.text.trim(),
+          })
+          .eq('id', institutionId)
+          .select('id')
+          .maybeSingle();
+
+      if (updatedInstitution == null) {
+        throw Exception('Institution location was not updated.');
+      }
+
+      return true;
+    } catch (e, stackTrace) {
+      debugPrint('NAOS: LOCATION SAVE ERROR: $e');
+      debugPrint('$stackTrace');
+      _showLocationSaveError('Could not save your school location.');
+      return false;
+    }
+  }
+
+  void _showLocationSaveError(String message) {
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  // ==========================================================
   // NEXT
   // ==========================================================
 
@@ -682,6 +738,14 @@ Future<void> _loadInstitution() async {
     // --------------------------------------------------------
 
     if (_step == 4 && !await _saveIdentity()) {
+      return;
+    }
+
+    // --------------------------------------------------------
+    // STEP 5 — LOCATION
+    // --------------------------------------------------------
+
+    if (_step == 5 && !await _saveLocation()) {
       return;
     }
 
