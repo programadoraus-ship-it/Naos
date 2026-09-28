@@ -27,6 +27,9 @@ ios/.symlinks/
 # Logs
 *.log
 
+# Flutter golden-test failure artifacts (keep approved test/goldens baselines)
+mobile/app/test/failures/
+
 # macOS
 .DS_Store
 

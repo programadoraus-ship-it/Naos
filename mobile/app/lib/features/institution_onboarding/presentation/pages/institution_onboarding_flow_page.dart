@@ -1,12 +1,38 @@
 import 'dart:async';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../../../../core/appearance/institution_appearance_asset_gateway.dart';
+import '../../../../core/appearance/institution_appearance_config.dart';
+import '../../../../core/appearance/institution_appearance_finish_service.dart';
+import '../../../../core/appearance/institution_appearance_file_vault.dart';
+import '../../../../core/appearance/institution_appearance_pending_store.dart';
+import '../../../../core/appearance/institution_appearance_repository.dart';
+import '../../../../core/navigation/app_router.dart';
+import '../../../../core/services/supabase/institution_admin_context.dart';
 import '../../../../core/services/supabase/supabase_service.dart';
+import '../../domain/institution_onboarding_progress.dart';
 import 'institution_onboarding_background.dart';
+import 'english_levels_editor.dart';
+import 'courses_editor.dart';
+import 'classes_editor.dart';
+import 'school_structure_draft.dart';
+import 'naos_tools_showcase.dart';
+import 'animated_welcome.dart';
+import 'institution_brand_draft.dart';
+import 'institution_brand_editor.dart';
+import 'institution_brand_config_mapper.dart';
+
+@visibleForTesting
+void openInstitutionDashboardAfterSetup(BuildContext context) {
+  Navigator.of(
+    context,
+  ).pushNamedAndRemoveUntil(AppRouter.institutionAdmin, (route) => false);
+}
 
 /// NAOS — Institution onboarding
 ///
@@ -35,13 +61,22 @@ class InstitutionOnboardingFlowPage extends StatefulWidget {
 class _InstitutionOnboardingFlowPageState
     extends State<InstitutionOnboardingFlowPage>
     with SingleTickerProviderStateMixin {
-  static const int _lastStep = 9;
+  static const int _lastStep = InstitutionOnboardingProgress.lastStep;
+  // Preserve persisted step IDs; legacy introduction (1) is merged into welcome.
+  static const _visibleSteps = [0, 2, 3, 4, 5, 6, 7, 8, 9];
 
   // ==========================================================
   // ONBOARDING
   // ==========================================================
 
   int _step = 0;
+  final _englishLevelsDraft = EnglishLevelsDraft();
+  final _coursesDraft = CoursesDraft();
+  late final _structure = SchoolStructureDraft(
+    _englishLevelsDraft,
+    _coursesDraft,
+  );
+  final _brandDraft = InstitutionBrandDraft();
 
   // ==========================================================
   // ANIMATION
@@ -57,8 +92,25 @@ class _InstitutionOnboardingFlowPageState
   String? _institutionAdminId;
 
   bool _loadingInstitution = true;
-  bool _savingSchoolName = false;
+  bool _advancing = false;
   bool _savingIdentity = false;
+  bool _onboardingWasValidlyCompleted = false;
+  String? _institutionContextError;
+
+  InstitutionAppearanceAssetGateway? _appearanceAssetGateway;
+  InstitutionAppearancePendingStore? _appearancePendingStore;
+  InstitutionAppearanceFileVault? _appearanceFileVault;
+  InstitutionAppearanceFinishService? _appearanceFinishService;
+  LoadedInstitutionAppearance? _activeAppearance;
+  PendingInstitutionAppearanceRequest? _pendingAppearanceRequest;
+  String? _activeBackgroundAssetId;
+  Uint8List? _activeBackgroundBytes;
+  final Map<int, String> _activeElementAssetIds = {};
+  final Map<int, Uint8List> _activeElementBytes = {};
+  bool _savingSetup = false;
+  int _uploadedAppearanceFiles = 0;
+  int _totalAppearanceFiles = 0;
+  String? _finishSetupError;
 
   Timer? _schoolNameSaveTimer;
 
@@ -66,14 +118,11 @@ class _InstitutionOnboardingFlowPageState
   // FORM CONTROLLERS
   // ==========================================================
 
-  final TextEditingController _schoolNameController =
-      TextEditingController();
+  final TextEditingController _schoolNameController = TextEditingController();
 
-  final TextEditingController _sloganController =
-      TextEditingController();
+  final TextEditingController _sloganController = TextEditingController();
 
-  final TextEditingController _descriptionController =
-      TextEditingController();
+  final TextEditingController _descriptionController = TextEditingController();
 
   final ImagePicker _imagePicker = ImagePicker();
 
@@ -81,165 +130,124 @@ class _InstitutionOnboardingFlowPageState
   String? _selectedLogoFileName;
   String? _savedLogoUrl;
 
-  final TextEditingController _countryController =
-      TextEditingController();
+  final TextEditingController _countryController = TextEditingController();
 
-  final TextEditingController _cityController =
-      TextEditingController();
+  final TextEditingController _cityController = TextEditingController();
 
-  final TextEditingController _addressController =
-      TextEditingController();
+  final TextEditingController _addressController = TextEditingController();
 
   // ==========================================================
   // INIT
   // ==========================================================
 
   @override
-void initState() {
-  super.initState();
+  void initState() {
+    super.initState();
 
-  _contentController = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 420),
-  )..forward();
+    _contentController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 420),
+    )..forward();
 
-  _loadInstitution();
-  
-}
-Future<void> _loadInstitution() async {
-  try {
-    final user = SupabaseService.client.auth.currentUser;
+    _loadInstitution();
+    _schoolNameController.addListener(_onSchoolNameChanged);
+  }
 
-    if (user == null) {
-      debugPrint('NAOS: No authenticated user found.');
+  Future<void> _loadInstitution() async {
+    try {
+      final user = SupabaseService.client.auth.currentUser;
 
-      if (mounted) {
-        setState(() {
-          _loadingInstitution = false;
-        });
+      if (user == null) {
+        debugPrint('NAOS: No authenticated user found.');
+
+        if (mounted) {
+          setState(() {
+            _loadingInstitution = false;
+          });
+        }
+
+        return;
       }
 
-      return;
-    }
+      debugPrint('========================================');
+      debugPrint('NAOS - LOADING INSTITUTION');
+      debugPrint('User ID: ${user.id}');
 
-    debugPrint('========================================');
-    debugPrint('NAOS - LOADING INSTITUTION');
-    debugPrint('User ID: ${user.id}');
+      // ==========================================================
+      // FIND ADMIN RECORD
+      // ==========================================================
 
-    // ==========================================================
-    // FIND ADMIN RECORD
-    // ==========================================================
+      final adminContext = await InstitutionAdminContextResolver(
+        SupabaseService.client,
+      ).resolve(user.id);
 
-    final adminData = await SupabaseService.client
-        .from('institution_admins')
-        .select('id, institution_id')
-        .eq('user_id', user.id)
-        .eq('is_active', true)
-        .limit(1)
-        .maybeSingle();
+      // ==========================================================
+      // NO ADMIN RECORD
+      // ==========================================================
 
-    // ==========================================================
-    // NO ADMIN RECORD
-    // ==========================================================
+      _institutionAdminId = adminContext.adminLinkId;
+      _institutionId = adminContext.institutionId;
 
-    if (adminData == null) {
-      debugPrint(
-        'NAOS: No active institution_admins record found.',
-      );
+      debugPrint('NAOS: Institution Admin ID = $_institutionAdminId');
 
-      _institutionAdminId = null;
-      _institutionId = null;
+      debugPrint('NAOS: Institution ID = $_institutionId');
 
-      if (mounted) {
-        setState(() {
-          _loadingInstitution = false;
-        });
+      // ==========================================================
+      // ADMIN APPROVED BUT NO INSTITUTION YET
+      // ==========================================================
+
+      if (_institutionId == null || _institutionId!.isEmpty) {
+        debugPrint('NAOS: Admin has NO institution yet.');
+
+        debugPrint('NAOS: Waiting for school name to create institution.');
+
+        // IMPORTANT:
+        // Do NOT put a default school name here.
+        _schoolNameController.clear();
+
+        if (mounted) {
+          setState(() {
+            _loadingInstitution = false;
+          });
+        }
+
+        return;
       }
 
-      return;
-    }
+      // ==========================================================
+      // EXISTING INSTITUTION
+      // ==========================================================
 
-    // ==========================================================
-    // STORE ADMIN RELATION ID
-    // ==========================================================
+      debugPrint('NAOS: Existing institution found.');
 
-    _institutionAdminId =
-        adminData['id'] as String?;
+      // ==========================================================
+      // LOAD EXISTING SCHOOL NAME
+      // ==========================================================
 
-    // ==========================================================
-    // GET INSTITUTION ID
-    // ==========================================================
+      final institutionData = await SupabaseService.client
+          .from('institutions')
+          .select(
+            'name, slogan, description, logo_url, country, city, address, '
+            'onboarding_completed, onboarding_step',
+          )
+          .eq('id', _institutionId!)
+          .maybeSingle();
 
-    _institutionId =
-        adminData['institution_id'] as String?;
-
-    debugPrint(
-      'NAOS: Institution Admin ID = $_institutionAdminId',
-    );
-
-    debugPrint(
-      'NAOS: Institution ID = $_institutionId',
-    );
-
-    // ==========================================================
-    // ADMIN APPROVED BUT NO INSTITUTION YET
-    // ==========================================================
-
-    if (_institutionId == null ||
-        _institutionId!.isEmpty) {
-      debugPrint(
-        'NAOS: Admin has NO institution yet.',
-      );
-
-      debugPrint(
-        'NAOS: Waiting for school name to create institution.',
-      );
-
-      // IMPORTANT:
-      // Do NOT put a default school name here.
-      _schoolNameController.clear();
-
-      if (mounted) {
-        setState(() {
-          _loadingInstitution = false;
-        });
+      if (institutionData == null) {
+        throw Exception('The linked institution could not be found.');
       }
 
-      return;
-    }
+      final progress = InstitutionOnboardingProgress.fromValues(
+        step: institutionData['onboarding_step'],
+        completed: institutionData['onboarding_completed'],
+      );
+      _onboardingWasValidlyCompleted = progress.isCompleted;
 
-    // ==========================================================
-    // EXISTING INSTITUTION
-    // ==========================================================
+      final savedName = institutionData['name'] as String?;
 
-    debugPrint(
-      'NAOS: Existing institution found.',
-    );
-
-    // ==========================================================
-    // LOAD EXISTING SCHOOL NAME
-    // ==========================================================
-
-    final institutionData = await SupabaseService.client
-        .from('institutions')
-        .select(
-          'name, slogan, description, logo_url, country, city, address',
-        )
-        .eq('id', _institutionId!)
-        .maybeSingle();
-
-    if (institutionData != null) {
-      final savedName =
-          institutionData['name'] as String?;
-
-      if (savedName != null &&
-          savedName.trim().isNotEmpty) {
-        _schoolNameController.text =
-            savedName.trim();
-
-        debugPrint(
-          'NAOS: Loaded school name = $savedName',
-        );
+      if (savedName != null && savedName.trim().isNotEmpty) {
+        _schoolNameController.text = savedName.trim();
+        debugPrint('NAOS: Loaded school name = $savedName');
       }
 
       _sloganController.text =
@@ -249,40 +257,229 @@ Future<void> _loadInstitution() async {
       _savedLogoUrl = institutionData['logo_url']?.toString().trim();
       _countryController.text =
           institutionData['country']?.toString().trim() ?? '';
-      _cityController.text =
-          institutionData['city']?.toString().trim() ?? '';
+      _cityController.text = institutionData['city']?.toString().trim() ?? '';
       _addressController.text =
           institutionData['address']?.toString().trim() ?? '';
+
+      await _loadAppearanceState(_institutionId!);
+
+      if (mounted) {
+        setState(() {
+          _institutionContextError = null;
+          _step = progress.resumeStep;
+          _loadingInstitution = false;
+        });
+        if (progress.message != null) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(progress.message!),
+                behavior: SnackBarBehavior.floating,
+              ),
+            );
+          });
+        }
+      }
+
+      if (_institutionId != null && _step >= 6) {
+        unawaited(_structure.load(SupabaseService.client, _institutionId!));
+      }
+
+      debugPrint('NAOS: Institution loading completed.');
+    } catch (e, stackTrace) {
+      debugPrint('NAOS: Error loading institution: $e');
+
+      debugPrint('$stackTrace');
+
+      if (mounted) {
+        setState(() {
+          _institutionContextError = 'Could not resolve your institution: $e';
+          _loadingInstitution = false;
+        });
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Could not resolve your institution: $e'),
+              behavior: SnackBarBehavior.floating,
+            ),
+          );
+        });
+      }
     }
+  }
 
-    if (mounted) {
-      setState(() {
-        _loadingInstitution = false;
-      });
+  Future<void> _loadAppearanceState(String institutionId) async {
+    final gateway = InstitutionAppearanceAssetGateway();
+    final repository = InstitutionAppearanceRepository(
+      SupabaseInstitutionAppearanceBackend(SupabaseService.client),
+    );
+    final pendingStore = InstitutionAppearancePendingStore(
+      await SharedPreferences.getInstance(),
+    );
+    final fileVault = createInstitutionAppearanceFileVault();
+    final finishService = InstitutionAppearanceFinishService(
+      backend: SupabaseInstitutionAppearanceCompletionBackend(
+        client: SupabaseService.client,
+        repository: repository,
+        assets: gateway,
+      ),
+      pendingStore: pendingStore,
+      fileVault: fileVault,
+    );
+    _appearanceAssetGateway = gateway;
+    _appearancePendingStore = pendingStore;
+    _appearanceFileVault = fileVault;
+    _appearanceFinishService = finishService;
+
+    final recovery = await finishService.recover(institutionId);
+    final active = await repository.load(institutionId);
+    _activeAppearance = active;
+    _pendingAppearanceRequest = recovery.request;
+    _activeBackgroundAssetId = null;
+    _activeBackgroundBytes = null;
+    _activeElementAssetIds.clear();
+    _activeElementBytes.clear();
+
+    final activeSelection = InstitutionBrandConfigMapper.restore(
+      _brandDraft,
+      active.config,
+    );
+    await _restoreActiveAppearanceFiles(active, activeSelection);
+
+    final pending = recovery.request;
+    if (pending != null) {
+      final pendingSelection = InstitutionBrandConfigMapper.restore(
+        _brandDraft,
+        pending.config,
+      );
+      await _restorePendingAppearanceFiles(pending, pendingSelection);
+      _finishSetupError =
+          'A previous save is ready to retry. Its draft is locked until the request finishes.';
     }
-
-    debugPrint(
-      'NAOS: Institution loading completed.',
-    );
-  } catch (e, stackTrace) {
-    debugPrint(
-      'NAOS: Error loading institution: $e',
-    );
-
-    debugPrint('$stackTrace');
-
-    if (mounted) {
-      setState(() {
-        _loadingInstitution = false;
+    if (recovery.cleanupFailures > 0 && mounted) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'A previous appearance cleanup is still pending. You can retry safely.',
+            ),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
       });
     }
   }
-}
+
+  Future<void> _restoreActiveAppearanceFiles(
+    LoadedInstitutionAppearance active,
+    RecoveredCustomAssetSelection selection,
+  ) async {
+    if (active.config.ambience['kind'] != 'my') return;
+    final gateway = _appearanceAssetGateway!;
+    final byId = {for (final asset in active.assets) asset.id: asset};
+    final backgroundId = selection.backgroundAssetId;
+    if (backgroundId != null && byId[backgroundId]?.signedUrl != null) {
+      final asset = byId[backgroundId]!;
+      final bytes = await gateway.download(asset.signedUrl!);
+      _activeBackgroundAssetId = backgroundId;
+      _activeBackgroundBytes = bytes;
+      _brandDraft.myBackground = MyAmbienceFile(
+        name: asset.storagePath.split('/').last,
+        bytes: bytes,
+        width: asset.width,
+        height: asset.height,
+        format: _formatFromMime(asset.mimeType),
+      );
+    }
+    for (final entry in selection.elementAssetIds.entries) {
+      final asset = byId[entry.value];
+      if (asset?.signedUrl == null) continue;
+      final bytes = await gateway.download(asset!.signedUrl!);
+      _activeElementAssetIds[entry.key] = asset.id;
+      _activeElementBytes[entry.key] = bytes;
+      _brandDraft.myElements[entry.key] = MyAmbienceFile(
+        name: asset.storagePath.split('/').last,
+        bytes: bytes,
+        width: asset.width,
+        height: asset.height,
+        format: _formatFromMime(asset.mimeType),
+      );
+    }
+  }
+
+  Future<void> _restorePendingAppearanceFiles(
+    PendingInstitutionAppearanceRequest pending,
+    RecoveredCustomAssetSelection selection,
+  ) async {
+    _brandDraft.myBackground = null;
+    _brandDraft.myElements.clear();
+    final vault = _appearanceFileVault!;
+    final active = _activeAppearance;
+    final activeById = {
+      for (final asset
+          in active?.assets ?? const <InstitutionAppearanceAsset>[])
+        asset.id: asset,
+    };
+    final activeBackgroundId = selection.backgroundAssetId;
+    if (activeBackgroundId != null &&
+        activeBackgroundId == _activeBackgroundAssetId &&
+        _activeBackgroundBytes != null) {
+      final asset = activeById[activeBackgroundId];
+      if (asset != null) {
+        _brandDraft.myBackground = MyAmbienceFile(
+          name: asset.storagePath.split('/').last,
+          bytes: _activeBackgroundBytes!,
+          width: asset.width,
+          height: asset.height,
+          format: _formatFromMime(asset.mimeType),
+        );
+      }
+    }
+    for (final entry in selection.elementAssetIds.entries) {
+      final bytes = _activeElementBytes[entry.key];
+      final asset = activeById[entry.value];
+      if (_activeElementAssetIds[entry.key] == entry.value &&
+          bytes != null &&
+          asset != null) {
+        _brandDraft.myElements[entry.key] = MyAmbienceFile(
+          name: asset.storagePath.split('/').last,
+          bytes: bytes,
+          width: asset.width,
+          height: asset.height,
+          format: _formatFromMime(asset.mimeType),
+        );
+      }
+    }
+    for (final asset in pending.assets) {
+      final bytes = await vault.read(asset.localPath);
+      final file = MyAmbienceFile(
+        name: asset.fileName,
+        bytes: bytes,
+        width: asset.width,
+        height: asset.height,
+        format: asset.format,
+      );
+      if (asset.kind == 'background' &&
+          selection.backgroundAssetId == asset.id) {
+        _brandDraft.myBackground = file;
+      } else if (asset.kind == 'element' &&
+          selection.elementAssetIds[asset.slot] == asset.id) {
+        _brandDraft.myElements[asset.slot] = file;
+      }
+    }
+  }
+
+  String _formatFromMime(String mime) => switch (mime) {
+    'image/jpeg' => 'jpg',
+    'image/webp' => 'webp',
+    _ => 'png',
+  };
   // ==========================================================
   // LOAD CURRENT ADMIN'S INSTITUTION
   // ==========================================================
-
-  
 
   // ==========================================================
   // SCHOOL NAME CHANGED
@@ -296,9 +493,7 @@ Future<void> _loadInstitution() async {
     _schoolNameSaveTimer?.cancel();
 
     _schoolNameSaveTimer = Timer(
-      const Duration(
-        milliseconds: 700,
-      ),
+      const Duration(milliseconds: 700),
       _saveSchoolName,
     );
   }
@@ -307,221 +502,74 @@ Future<void> _loadInstitution() async {
   // SAVE SCHOOL NAME
   // ==========================================================
 
-  Future<void> _saveSchoolName() async {
-  final schoolName =
-      _schoolNameController.text.trim();
+  Future<bool>? _schoolNameSave;
 
-  if (schoolName.isEmpty) {
-    debugPrint(
-      'NAOS: School name is empty. Nothing to save.',
-    );
-    return;
+  Future<bool> _saveSchoolName() {
+    _schoolNameSaveTimer?.cancel();
+    final pending = _schoolNameSave;
+    if (pending != null) return pending;
+    final future = _persistSchoolName();
+    _schoolNameSave = future;
+    return future.whenComplete(() {
+      _schoolNameSave = null;
+    });
   }
 
-  if (_savingSchoolName) {
-    debugPrint(
-      'NAOS: School name is already being saved.',
-    );
-    return;
-  }
+  Future<bool> _persistSchoolName() async {
+    try {
+      // A name edited while saving must also be persisted before Continue.
+      while (true) {
+        final schoolName = _schoolNameController.text.trim();
+        if (schoolName.isEmpty) throw Exception('School name is required.');
+        final user = SupabaseService.client.auth.currentUser;
+        if (user == null) throw Exception('No authenticated user.');
 
-  final user =
-      SupabaseService.client.auth.currentUser;
+        if (_institutionId == null || _institutionId!.isEmpty) {
+          final result = await SupabaseService.client.rpc(
+            'bootstrap_institution',
+            params: {'p_name': schoolName},
+          );
+          if (result is! String ||
+              !RegExp(
+                r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+              ).hasMatch(result)) {
+            throw Exception('Bootstrap returned an invalid institution ID.');
+          }
+          final relation = await SupabaseService.client
+              .from('institution_admins')
+              .select('id')
+              .eq('user_id', user.id)
+              .eq('institution_id', result)
+              .eq('is_active', true)
+              .single();
+          // Do not expose an unverified/partially loaded relation to next steps.
+          _institutionId = result;
+          _institutionAdminId = relation['id'] as String;
+        }
 
-  if (user == null) {
-    debugPrint(
-      'NAOS: Cannot save school name. '
-      'No authenticated user.',
-    );
-    return;
-  }
-
-  _savingSchoolName = true;
-
-  debugPrint('========================================');
-  debugPrint('NAOS - SAVING SCHOOL NAME');
-  debugPrint('User ID: ${user.id}');
-  debugPrint(
-    'Current Institution ID: $_institutionId',
-  );
-  debugPrint(
-    'Admin Relation ID: $_institutionAdminId',
-  );
-  debugPrint(
-    'New school name: $schoolName',
-  );
-
-  try {
-    // ========================================================
-    // CASE 1
-    // ADMIN ALREADY HAS AN INSTITUTION
-    // ========================================================
-
-    if (_institutionId != null &&
-        _institutionId!.isNotEmpty) {
-      debugPrint(
-        'NAOS: Existing institution found.',
-      );
-
-      debugPrint(
-        'NAOS: Updating existing institution...',
-      );
-
-      final updatedInstitution =
-          await SupabaseService.client
-              .from('institutions')
-              .update({
-                'name': schoolName,
-              })
-              .eq(
-                'id',
-                _institutionId!,
-              )
-              .select('id, name')
-              .maybeSingle();
-
-      if (updatedInstitution == null) {
-        throw Exception(
-          'Institution was not updated. '
-          'Check RLS policies or institution ID.',
+        // Also covers a retry after a committed bootstrap whose response was lost.
+        final updated = await SupabaseService.client
+            .from('institutions')
+            .update({'name': schoolName})
+            .eq('id', _institutionId!)
+            .select('id, name')
+            .maybeSingle();
+        if (updated == null) throw Exception('Institution was not updated.');
+        if (!mounted) return false;
+        if (_schoolNameController.text.trim() == schoolName) return true;
+      }
+    } catch (e, stackTrace) {
+      debugPrint('NAOS: SCHOOL NAME SAVE ERROR: $e\n$stackTrace');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Could not save your school name. Please try again.'),
+          ),
         );
       }
-
-      debugPrint(
-        'NAOS: Existing institution updated successfully.',
-      );
-
-      debugPrint(
-        'NAOS: Updated institution = '
-        '$updatedInstitution',
-      );
-
-      return;
+      return false;
     }
-
-    // ========================================================
-    // CASE 2
-    // ADMIN DOES NOT HAVE AN INSTITUTION
-    //
-    // CREATE NEW INSTITUTION
-    // ========================================================
-
-    debugPrint(
-      'NAOS: Admin has no institution.',
-    );
-
-    debugPrint(
-      'NAOS: Creating new institution...',
-    );
-
-    final newInstitution =
-        await SupabaseService.client
-            .from('institutions')
-            .insert({
-              'name': schoolName,
-            })
-            .select('id, name')
-            .single();
-
-    final newInstitutionId =
-        newInstitution['id'] as String?;
-
-    if (newInstitutionId == null ||
-        newInstitutionId.isEmpty) {
-      throw Exception(
-        'Institution was created but no ID was returned.',
-      );
-    }
-
-    debugPrint(
-      'NAOS: New institution created.',
-    );
-
-    debugPrint(
-      'NAOS: New Institution ID = '
-      '$newInstitutionId',
-    );
-
-    // ========================================================
-    // LINK ADMIN TO NEW INSTITUTION
-    // ========================================================
-
-    if (_institutionAdminId != null &&
-        _institutionAdminId!.isNotEmpty) {
-      debugPrint(
-        'NAOS: Linking existing admin record...',
-      );
-
-      await SupabaseService.client
-          .from('institution_admins')
-          .update({
-            'institution_id': newInstitutionId,
-          })
-          .eq(
-            'id',
-            _institutionAdminId!,
-          );
-
-      debugPrint(
-        'NAOS: Existing admin record linked successfully.',
-      );
-    } else {
-      // ======================================================
-      // NO ADMIN RECORD EXISTS
-      //
-      // CREATE THE RELATION NOW
-      // ======================================================
-
-      debugPrint(
-        'NAOS: No admin relation exists.',
-      );
-
-      debugPrint(
-        'NAOS: Creating institution_admins record...',
-      );
-
-      final newAdminRelation =
-          await SupabaseService.client
-              .from('institution_admins')
-              .insert({
-                'user_id': user.id,
-                'institution_id': newInstitutionId,
-                'is_active': true,
-              })
-              .select('id')
-              .single();
-
-      _institutionAdminId =
-          newAdminRelation['id'] as String?;
-
-      debugPrint(
-        'NAOS: New admin relation created.',
-      );
-    }
-
-    // ========================================================
-    // STORE NEW ID LOCALLY
-    // ========================================================
-
-    _institutionId = newInstitutionId;
-
-    debugPrint(
-      'NAOS: Institution setup completed successfully.',
-    );
-
-    debugPrint(
-      'NAOS: School name saved = $schoolName',
-    );
-  } catch (e, stackTrace) {
-    debugPrint(
-      'NAOS: SCHOOL NAME SAVE ERROR: $e',
-    );
-
-    debugPrint('$stackTrace');
-  } finally {
-    _savingSchoolName = false;
   }
-}
 
   // ==========================================================
   // LOGO PICKER
@@ -538,21 +586,14 @@ Future<void> _loadInstitution() async {
 
     final extension = pickedFile.name.split('.').last.toLowerCase();
 
-    const allowedExtensions = {
-      'png',
-      'jpg',
-      'jpeg',
-      'webp',
-    };
+    const allowedExtensions = {'png', 'jpg', 'jpeg', 'webp'};
 
     if (!allowedExtensions.contains(extension)) {
       if (!mounted) return;
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text(
-            'Please choose a PNG, JPG, JPEG, or WebP logo.',
-          ),
+          content: Text('Please choose a PNG, JPG, JPEG, or WebP logo.'),
           behavior: SnackBarBehavior.floating,
         ),
       );
@@ -593,8 +634,7 @@ Future<void> _loadInstitution() async {
       String? logoUrl;
 
       if (_selectedLogoBytes != null && _selectedLogoFileName != null) {
-        final extension =
-            _selectedLogoFileName!.split('.').last.toLowerCase();
+        final extension = _selectedLogoFileName!.split('.').last.toLowerCase();
         final logoPath = '$institutionId/logo.$extension';
 
         await SupabaseService.client.storage
@@ -665,10 +705,7 @@ Future<void> _loadInstitution() async {
     if (!mounted) return;
 
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        behavior: SnackBarBehavior.floating,
-      ),
+      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
     );
   }
 
@@ -713,10 +750,7 @@ Future<void> _loadInstitution() async {
     if (!mounted) return;
 
     ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(message),
-        behavior: SnackBarBehavior.floating,
-      ),
+      SnackBar(content: Text(message), behavior: SnackBarBehavior.floating),
     );
   }
 
@@ -725,100 +759,137 @@ Future<void> _loadInstitution() async {
   // ==========================================================
 
   Future<void> _next() async {
-    // --------------------------------------------------------
-    // STEP 3 — SCHOOL NAME
-    // --------------------------------------------------------
+    if (_advancing) return;
+    _advancing = true;
+    try {
+      // --------------------------------------------------------
+      // STEP 3 — SCHOOL NAME
+      // --------------------------------------------------------
 
-    if (_step == 3) {
-      await _saveSchoolName();
+      if (_step == 3 && !await _saveSchoolName()) {
+        return;
+      }
+
+      // --------------------------------------------------------
+      // STEP 4 — IDENTITY
+      // --------------------------------------------------------
+
+      if (_step == 4 && !await _saveIdentity()) {
+        return;
+      }
+
+      // --------------------------------------------------------
+      // STEP 5 — LOCATION
+      // --------------------------------------------------------
+
+      if (_step == 5 && !await _saveLocation()) {
+        return;
+      }
+      if (_step == 6 &&
+          (_institutionId == null ||
+              !await _structure.save(
+                SupabaseService.client,
+                _institutionId!,
+              ))) {
+        return;
+      }
+
+      if (_step == 8) {
+        await _finish();
+        return;
+      }
+
+      // --------------------------------------------------------
+      // FINISH
+      // --------------------------------------------------------
+
+      if (_step >= _lastStep) {
+        await _finish();
+        return;
+      }
+
+      // --------------------------------------------------------
+      // SAVE NEXT STEP
+      // --------------------------------------------------------
+
+      final nextStep = _step == 0 ? 2 : _step + 1;
+
+      if (!await _saveOnboardingStep(nextStep)) {
+        return;
+      }
+
+      if (!mounted) return;
+
+      _changeStep(nextStep);
+    } finally {
+      _advancing = false;
     }
-
-    // --------------------------------------------------------
-    // STEP 4 — IDENTITY
-    // --------------------------------------------------------
-
-    if (_step == 4 && !await _saveIdentity()) {
-      return;
-    }
-
-    // --------------------------------------------------------
-    // STEP 5 — LOCATION
-    // --------------------------------------------------------
-
-    if (_step == 5 && !await _saveLocation()) {
-      return;
-    }
-
-    // --------------------------------------------------------
-    // FINISH
-    // --------------------------------------------------------
-
-    if (_step >= _lastStep) {
-      await _finish();
-      return;
-    }
-
-    // --------------------------------------------------------
-    // SAVE NEXT STEP
-    // --------------------------------------------------------
-
-    final nextStep = _step + 1;
-
-    await _saveOnboardingStep(
-      nextStep,
-    );
-
-    if (!mounted) return;
-
-    _changeStep(
-      nextStep,
-    );
   }
 
   // ==========================================================
   // SAVE ONBOARDING STEP
   // ==========================================================
 
-  Future<void> _saveOnboardingStep(
-    int step,
-  ) async {
+  Future<bool> _saveOnboardingStep(int step) async {
     final institutionId = _institutionId;
 
-    if (institutionId == null ||
-        institutionId.isEmpty) {
-      return;
+    if (institutionId == null || institutionId.isEmpty) {
+      // A newly approved administrator reaches School name before the
+      // institution exists. Those introductory transitions are local only.
+      if (step <= 3) {
+        return true;
+      }
+      _showProgressSaveError();
+      return false;
+    }
+
+    // A fully completed school may revisit previous screens to edit its data.
+    // Navigating inside that editor must not downgrade completion or step 9.
+    if (_onboardingWasValidlyCompleted) {
+      return true;
     }
 
     try {
-      await SupabaseService.client
+      final updated = await SupabaseService.client
           .from('institutions')
-          .update({
-        'onboarding_step': step,
-      }).eq(
-        'id',
-        institutionId,
-      );
+          .update({'onboarding_step': step, 'onboarding_completed': false})
+          .eq('id', institutionId)
+          .select('id')
+          .maybeSingle();
 
-      debugPrint(
-        'Onboarding step saved: $step',
-      );
-    } catch (e) {
-      debugPrint(
-        'ONBOARDING STEP SAVE ERROR: $e',
-      );
+      if (updated == null) {
+        throw Exception('The onboarding progress was not updated.');
+      }
+
+      debugPrint('Onboarding step saved: $step');
+      return true;
+    } catch (e, stackTrace) {
+      debugPrint('ONBOARDING STEP SAVE ERROR: $e');
+      debugPrint('$stackTrace');
+      _showProgressSaveError();
+      return false;
     }
+  }
+
+  void _showProgressSaveError() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Could not save your onboarding progress. Please try again.',
+        ),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
   }
 
   // ==========================================================
   // CHANGE STEP
   // ==========================================================
 
-  void _changeStep(
-    int nextStep,
-  ) {
-    if (nextStep < 0 ||
-        nextStep > _lastStep ||
-        nextStep == _step) {
+  void _changeStep(int nextStep) {
+    if (nextStep == 1) nextStep = 0;
+    if (nextStep < 0 || nextStep > _lastStep || nextStep == _step) {
       return;
     }
 
@@ -829,6 +900,9 @@ Future<void> _loadInstitution() async {
     });
 
     _contentController.forward();
+    if (nextStep == 6 && _institutionId != null) {
+      unawaited(_structure.load(SupabaseService.client, _institutionId!));
+    }
   }
 
   // ==========================================================
@@ -836,13 +910,12 @@ Future<void> _loadInstitution() async {
   // ==========================================================
 
   void _back() {
+    if (_advancing || _schoolNameSave != null) return;
     if (_step <= 0) {
       return;
     }
 
-    _changeStep(
-      _step - 1,
-    );
+    _changeStep(_step == 2 ? 0 : _step - 1);
   }
 
   // ==========================================================
@@ -851,52 +924,116 @@ Future<void> _loadInstitution() async {
 
   Future<void> _finish() async {
     final institutionId = _institutionId;
-
-    if (institutionId == null ||
-        institutionId.isEmpty) {
+    final service = _appearanceFinishService;
+    final active = _activeAppearance;
+    if (_savingSetup ||
+        institutionId == null ||
+        institutionId.isEmpty ||
+        service == null ||
+        active == null) {
       return;
     }
-
+    setState(() {
+      _savingSetup = true;
+      _finishSetupError = null;
+      _uploadedAppearanceFiles = 0;
+      _totalAppearanceFiles = 0;
+    });
     try {
-      await SupabaseService.client
-          .from('institutions')
-          .update({
-        'onboarding_completed': true,
-        'onboarding_step': _lastStep,
-      }).eq(
-        'id',
-        institutionId,
+      final localFiles = <LocalAppearanceUpload>[];
+      String? retainedBackgroundId;
+      final retainedElementIds = <int, String>{};
+      if (_brandDraft.ambience == InstitutionAmbience.my) {
+        final background = _brandDraft.myBackground;
+        if (background != null &&
+            _activeBackgroundAssetId != null &&
+            listEquals(background.bytes, _activeBackgroundBytes)) {
+          retainedBackgroundId = _activeBackgroundAssetId;
+        } else if (background != null) {
+          localFiles.add(
+            LocalAppearanceUpload(
+              kind: 'background',
+              slot: 0,
+              fileName: background.name,
+              bytes: background.bytes,
+              width: background.width,
+              height: background.height,
+              format: background.format,
+            ),
+          );
+        }
+        for (final entry in _brandDraft.myElements.entries) {
+          final activeBytes = _activeElementBytes[entry.key];
+          final activeId = _activeElementAssetIds[entry.key];
+          if (activeId != null && listEquals(entry.value.bytes, activeBytes)) {
+            retainedElementIds[entry.key] = activeId;
+          } else {
+            localFiles.add(
+              LocalAppearanceUpload(
+                kind: 'element',
+                slot: entry.key,
+                fileName: entry.value.name,
+                bytes: entry.value.bytes,
+                width: entry.value.width,
+                height: entry.value.height,
+                format: entry.value.format,
+              ),
+            );
+          }
+        }
+      }
+      final result = await service.finish(
+        expectedInstitutionId: institutionId,
+        expectedRevision: active.revision,
+        localFiles: localFiles,
+        buildConfig: (backgroundId, elementIds) =>
+            InstitutionBrandConfigMapper.encode(
+              _brandDraft,
+              customBackgroundAssetId: backgroundId ?? retainedBackgroundId,
+              customElementAssetIds: {...retainedElementIds, ...elementIds},
+            ),
+        onUploadProgress: (completed, total) {
+          if (!mounted) return;
+          setState(() {
+            _uploadedAppearanceFiles = completed;
+            _totalAppearanceFiles = total;
+          });
+        },
       );
-
-      debugPrint(
-        'ONBOARDING COMPLETED',
-      );
-
+      _activeAppearance = result.appearance;
+      _pendingAppearanceRequest = null;
+      _onboardingWasValidlyCompleted = true;
+      debugPrint('ONBOARDING COMPLETED');
       if (!mounted) return;
-
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text(
-            'Your NAOS setup is ready. ✨',
-          ),
+          content: Text('Your NAOS setup is ready. ✨'),
           behavior: SnackBarBehavior.floating,
         ),
       );
-    } catch (e) {
-      debugPrint(
-        'ONBOARDING FINISH ERROR: $e',
-      );
-
+      openInstitutionDashboardAfterSetup(context);
+    } on InstitutionAppearanceFinishException catch (e) {
+      debugPrint('ONBOARDING FINISH ERROR: $e');
       if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Could not complete the setup.',
-          ),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
+      setState(() {
+        _pendingAppearanceRequest = _appearancePendingStore?.load(
+          institutionId,
+        );
+        _finishSetupError = e.cleanupPending
+            ? '${e.message} File cleanup will resume next time.'
+            : e.message;
+      });
+    } catch (e, stackTrace) {
+      debugPrint('ONBOARDING FINISH ERROR: $e');
+      debugPrint('$stackTrace');
+      if (mounted) {
+        setState(() {
+          _finishSetupError =
+              'Your school could not be saved. Your draft is safe.';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _savingSetup = false);
     }
   }
 
@@ -945,105 +1082,145 @@ Future<void> _loadInstitution() async {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF020514),
-      body: Stack(
-        fit: StackFit.expand,
-        children: [
-          // ----------------------------------------------------
-          // COSMIC BACKGROUND
-          // ----------------------------------------------------
+    return PopScope(
+      canPop: !_savingSetup,
+      child: Scaffold(
+        backgroundColor: const Color(0xFF020514),
+        body: Stack(
+          fit: StackFit.expand,
+          children: [
+            // ----------------------------------------------------
+            // COSMIC BACKGROUND
+            // ----------------------------------------------------
+            const Positioned.fill(child: InstitutionOnboardingBackground()),
 
-          const Positioned.fill(
-            child: InstitutionOnboardingBackground(),
-          ),
+            // ----------------------------------------------------
+            // CONTENT
+            // ----------------------------------------------------
+            SafeArea(
+              child: AbsorbPointer(
+                absorbing: _savingSetup,
+                child: AnimatedBuilder(
+                  animation: _contentController,
+                  builder: (context, child) {
+                    final value = Curves.easeOutCubic.transform(
+                      _contentController.value,
+                    );
 
-          // ----------------------------------------------------
-          // CONTENT
-          // ----------------------------------------------------
+                    return Opacity(
+                      opacity: value,
+                      child: Transform.translate(
+                        offset: Offset(0, 16 * (1 - value)),
+                        child: child,
+                      ),
+                    );
+                  },
+                  child: AnimatedSwitcher(
+                    duration: const Duration(milliseconds: 360),
+                    switchInCurve: Curves.easeOutCubic,
+                    switchOutCurve: Curves.easeInCubic,
+                    transitionBuilder: (child, animation) {
+                      final slide =
+                          Tween<Offset>(
+                            begin: const Offset(0, 0.025),
+                            end: Offset.zero,
+                          ).animate(
+                            CurvedAnimation(
+                              parent: animation,
+                              curve: Curves.easeOutCubic,
+                            ),
+                          );
 
-          SafeArea(
-            child: AnimatedBuilder(
-              animation: _contentController,
-              builder: (context, child) {
-                final value =
-                    Curves.easeOutCubic.transform(
-                  _contentController.value,
-                );
-
-                return Opacity(
-                  opacity: value,
-                  child: Transform.translate(
-                    offset: Offset(
-                      0,
-                      16 * (1 - value),
+                      return FadeTransition(
+                        opacity: animation,
+                        child: SlideTransition(position: slide, child: child),
+                      );
+                    },
+                    child: KeyedSubtree(
+                      key: ValueKey<int>(_step),
+                      child: _buildCurrentStep(),
                     ),
-                    child: child,
                   ),
-                );
-              },
-              child: AnimatedSwitcher(
-                duration: const Duration(
-                  milliseconds: 360,
-                ),
-                switchInCurve: Curves.easeOutCubic,
-                switchOutCurve: Curves.easeInCubic,
-                transitionBuilder: (
-                  child,
-                  animation,
-                ) {
-                  final slide = Tween<Offset>(
-                    begin: const Offset(0, 0.025),
-                    end: Offset.zero,
-                  ).animate(
-                    CurvedAnimation(
-                      parent: animation,
-                      curve: Curves.easeOutCubic,
-                    ),
-                  );
-
-                  return FadeTransition(
-                    opacity: animation,
-                    child: SlideTransition(
-                      position: slide,
-                      child: child,
-                    ),
-                  );
-                },
-                child: KeyedSubtree(
-                  key: ValueKey<int>(_step),
-                  child: _buildCurrentStep(),
                 ),
               ),
             ),
-          ),
 
-          // ----------------------------------------------------
-          // BACK BUTTON
-          // ----------------------------------------------------
-
-          if (_step > 0)
-            Positioned(
-              top: 14,
-              left: 14,
-              child: SafeArea(
-                child: _buildBackButton(),
+            // ----------------------------------------------------
+            // BACK BUTTON
+            // ----------------------------------------------------
+            if (!_loadingInstitution &&
+                _institutionContextError == null &&
+                _step > 0 &&
+                !_savingSetup)
+              Positioned(
+                top: 14,
+                left: 14,
+                child: SafeArea(child: _buildBackButton()),
               ),
-            ),
 
-          // ----------------------------------------------------
-          // STEP INDICATOR
-          // ----------------------------------------------------
-
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 14,
-            child: SafeArea(
-              child: _buildStepIndicator(),
-            ),
-          ),
-        ],
+            // ----------------------------------------------------
+            // STEP INDICATOR
+            // ----------------------------------------------------
+            if (!_loadingInstitution && _institutionContextError == null)
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 14,
+                child: SafeArea(child: _buildStepIndicator()),
+              ),
+            if (_savingSetup)
+              Positioned.fill(
+                child: ColoredBox(
+                  color: const Color(0xCC020514),
+                  child: Center(
+                    child: Container(
+                      width: 360,
+                      margin: const EdgeInsets.all(24),
+                      padding: const EdgeInsets.all(28),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF10173D),
+                        borderRadius: BorderRadius.circular(24),
+                        border: Border.all(color: const Color(0xFF7770FF)),
+                      ),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const CircularProgressIndicator(
+                            color: Color(0xFF8077FF),
+                          ),
+                          const SizedBox(height: 20),
+                          const Text(
+                            'Saving your school…',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 20,
+                              fontWeight: FontWeight.w800,
+                            ),
+                          ),
+                          if (_totalAppearanceFiles > 0) ...[
+                            const SizedBox(height: 12),
+                            Text(
+                              'Uploading $_uploadedAppearanceFiles of '
+                              '$_totalAppearanceFiles files',
+                              style: const TextStyle(color: Color(0xFFC5C9EE)),
+                            ),
+                            const SizedBox(height: 10),
+                            LinearProgressIndicator(
+                              value:
+                                  _uploadedAppearanceFiles /
+                                  _totalAppearanceFiles,
+                              color: const Color(0xFF8077FF),
+                              backgroundColor: Colors.white12,
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
@@ -1053,12 +1230,69 @@ Future<void> _loadInstitution() async {
   // ==========================================================
 
   Widget _buildCurrentStep() {
+    if (_loadingInstitution) {
+      return const Center(
+        child: CircularProgressIndicator(color: Color(0xFF8077FF)),
+      );
+    }
+
+    final contextError = _institutionContextError;
+    if (contextError != null) {
+      return _contentShell(
+        maxWidth: 680,
+        child: Container(
+          padding: const EdgeInsets.all(28),
+          decoration: BoxDecoration(
+            color: const Color(0xE60B1235),
+            borderRadius: BorderRadius.circular(24),
+            border: Border.all(color: const Color(0xFF8B86FF)),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.error_outline_rounded,
+                color: Color(0xFFFFB4AB),
+                size: 40,
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Institution link needs review',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 24,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                contextError,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Color(0xFFD5D8F5),
+                  fontSize: 15,
+                  height: 1.45,
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'No institution was selected or changed automatically.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Color(0xFFAEB4D8), fontSize: 13),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     switch (_step) {
       case 0:
         return _buildWelcome();
 
       case 1:
-        return _buildNaosIntro();
+        return _buildWelcome();
 
       case 2:
         return _buildWhatIsNaos();
@@ -1096,8 +1330,7 @@ Future<void> _loadInstitution() async {
   Widget _buildWelcome() {
     return _contentShell(
       maxWidth: 820,
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
+      child: AnimatedWelcome(
         children: [
           const Text(
             'WELCOME, ADMINISTRATOR',
@@ -1112,9 +1345,7 @@ Future<void> _loadInstitution() async {
 
           const SizedBox(height: 16),
 
-          _buildNaosLogo(
-            size: 112,
-          ),
+          _buildNaosLogo(size: 112),
 
           const SizedBox(height: 18),
 
@@ -1149,10 +1380,7 @@ Future<void> _loadInstitution() async {
                   decoration: BoxDecoration(
                     borderRadius: BorderRadius.circular(10),
                     gradient: const LinearGradient(
-                      colors: [
-                        Color(0xFF8B82FF),
-                        Color(0xFF5B58FF),
-                      ],
+                      colors: [Color(0xFF8B82FF), Color(0xFF5B58FF)],
                     ),
                   ),
                 ),
@@ -1203,27 +1431,21 @@ Future<void> _loadInstitution() async {
                     vertical: 13,
                   ),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF11183B)
-                        .withOpacity(0.52),
+                    color: const Color(0xFF11183B).withOpacity(0.52),
                     borderRadius: BorderRadius.circular(16),
                     border: Border.all(
-                      color: const Color(0xFF6975E8)
-                          .withOpacity(0.15),
+                      color: const Color(0xFF6975E8).withOpacity(0.15),
                     ),
                   ),
                   child: Row(
                     children: [
-                      _buildSmallIcon(
-                        Icons.rocket_launch_rounded,
-                        size: 42,
-                      ),
+                      _buildSmallIcon(Icons.rocket_launch_rounded, size: 42),
 
                       const SizedBox(width: 13),
 
                       Expanded(
                         child: Column(
-                          crossAxisAlignment:
-                              CrossAxisAlignment.start,
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             const Text(
                               'Your journey starts here',
@@ -1239,8 +1461,7 @@ Future<void> _loadInstitution() async {
                             Text(
                               'School identity • Location • Structure • Design',
                               style: TextStyle(
-                                color: Colors.white
-                                    .withOpacity(0.38),
+                                color: Colors.white.withOpacity(0.38),
                                 fontSize: 10.5,
                                 height: 1.3,
                               ),
@@ -1286,137 +1507,6 @@ Future<void> _loadInstitution() async {
   }
 
   // ==========================================================
-  // STEP 1 — NAOS INTRODUCTION
-  // ==========================================================
-
-  Widget _buildNaosIntro() {
-    return _contentShell(
-      maxWidth: 900,
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const Text(
-            'NAOS',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 44,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 5.5,
-              height: 1,
-            ),
-          ),
-
-          const SizedBox(height: 10),
-
-          const Text(
-            'Welcome, Administrator.',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Color(0xFFC2C6E8),
-              fontSize: 16,
-              fontWeight: FontWeight.w600,
-              letterSpacing: -0.2,
-            ),
-          ),
-
-          const SizedBox(height: 58),
-
-          _buildNaosLogo(
-            size: 112,
-          ),
-
-          const SizedBox(height: 58),
-
-          const Text(
-            "Today you're taking a big step",
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 21,
-              fontWeight: FontWeight.w800,
-              letterSpacing: -0.35,
-            ),
-          ),
-
-          const SizedBox(height: 8),
-
-          const Text(
-            'toward building your school.',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Color(0xFFAEB5FF),
-              fontSize: 17,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-
-          const SizedBox(height: 30),
-
-          _buildPrimaryButton(
-            label: _buttonLabel,
-            icon: Icons.arrow_forward_rounded,
-            onPressed: _next,
-          ),
-
-          const SizedBox(height: 24),
-
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: List.generate(
-              7,
-              (index) {
-                final active = index == 1;
-
-                return AnimatedContainer(
-                  duration: const Duration(
-                    milliseconds: 250,
-                  ),
-                  curve: Curves.easeOut,
-                  margin: const EdgeInsets.symmetric(
-                    horizontal: 4,
-                  ),
-                  width: active ? 8 : 6,
-                  height: active ? 8 : 6,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    color: active
-                        ? const Color(0xFF8B82FF)
-                        : Colors.white.withOpacity(0.18),
-                    boxShadow: active
-                        ? [
-                            BoxShadow(
-                              color: const Color(0xFF756CFF)
-                                  .withOpacity(0.45),
-                              blurRadius: 8,
-                              spreadRadius: 1,
-                            ),
-                          ]
-                        : null,
-                  ),
-                );
-              },
-            ),
-          ),
-
-          const SizedBox(height: 10),
-
-          Text(
-            'Step 2 of 7',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Colors.white.withOpacity(0.27),
-              fontSize: 10,
-              fontWeight: FontWeight.w500,
-              letterSpacing: 0.2,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ==========================================================
   // STEP 2 — WHAT IS NAOS
   // ==========================================================
 
@@ -1426,9 +1516,7 @@ Future<void> _loadInstitution() async {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          _buildNaosLogo(
-            size: 82,
-          ),
+          _buildNaosLogo(size: 82),
 
           const SizedBox(height: 18),
 
@@ -1461,9 +1549,7 @@ Future<void> _loadInstitution() async {
           const SizedBox(height: 15),
 
           Padding(
-            padding: const EdgeInsets.symmetric(
-              horizontal: 30,
-            ),
+            padding: const EdgeInsets.symmetric(horizontal: 30),
             child: _mutedText(
               'A single place where your academy can grow, '
               'connect people, organize learning and bring '
@@ -1583,10 +1669,7 @@ Future<void> _loadInstitution() async {
       children: [
         const Text(
           'Logo',
-          style: TextStyle(
-            color: Color(0xFF9EA5D6),
-            fontSize: 13,
-          ),
+          style: TextStyle(color: Color(0xFF9EA5D6), fontSize: 13),
         ),
 
         const SizedBox(height: 8),
@@ -1597,17 +1680,12 @@ Future<void> _loadInstitution() async {
           decoration: BoxDecoration(
             color: const Color(0x6610183C),
             borderRadius: BorderRadius.circular(16),
-            border: Border.all(
-              color: const Color(0xFF3C478B).withOpacity(0.5),
-            ),
+            border: Border.all(color: const Color(0xFF3C478B).withOpacity(0.5)),
           ),
           child: hasLogo
               ? Padding(
                   padding: const EdgeInsets.all(16),
-                  child: Image.memory(
-                    _selectedLogoBytes!,
-                    fit: BoxFit.contain,
-                  ),
+                  child: Image.memory(_selectedLogoBytes!, fit: BoxFit.contain),
                 )
               : savedLogoUrl != null && savedLogoUrl.isNotEmpty
               ? Padding(
@@ -1615,8 +1693,7 @@ Future<void> _loadInstitution() async {
                   child: Image.network(
                     savedLogoUrl,
                     fit: BoxFit.contain,
-                    errorBuilder: (_, __, ___) =>
-                        _buildEmptyLogoPlaceholder(),
+                    errorBuilder: (_, __, ___) => _buildEmptyLogoPlaceholder(),
                   ),
                 )
               : _buildEmptyLogoPlaceholder(),
@@ -1638,9 +1715,7 @@ Future<void> _loadInstitution() async {
           ),
           style: OutlinedButton.styleFrom(
             foregroundColor: const Color(0xFFB9BFFF),
-            side: const BorderSide(
-              color: Color(0xFF6570D8),
-            ),
+            side: const BorderSide(color: Color(0xFF6570D8)),
           ),
         ),
 
@@ -1648,10 +1723,7 @@ Future<void> _loadInstitution() async {
           const SizedBox(height: 8),
           Text(
             _selectedLogoFileName!,
-            style: const TextStyle(
-              color: Colors.white38,
-              fontSize: 12,
-            ),
+            style: const TextStyle(color: Colors.white38, fontSize: 12),
           ),
         ],
       ],
@@ -1670,10 +1742,7 @@ Future<void> _loadInstitution() async {
         SizedBox(height: 8),
         Text(
           'PNG, JPG, or WebP',
-          style: TextStyle(
-            color: Colors.white54,
-            fontSize: 13,
-          ),
+          style: TextStyle(color: Colors.white54, fontSize: 13),
         ),
       ],
     );
@@ -1725,75 +1794,147 @@ Future<void> _loadInstitution() async {
   // ==========================================================
 
   Widget _buildBuildSchool() {
-    return _contentShell(
-      maxWidth: 820,
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          _buildNaosLogo(
-            size: 72,
-          ),
+    return ListenableBuilder(
+      listenable: _structure,
+      builder: (context, _) => _contentShell(
+        maxWidth: 820,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            _buildNaosLogo(size: 72),
 
-          const SizedBox(height: 14),
+            const SizedBox(height: 14),
 
-          const Text(
-            'BUILD YOUR SCHOOL',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 34,
-              fontWeight: FontWeight.w800,
+            const Text(
+              'BUILD YOUR SCHOOL',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 34,
+                fontWeight: FontWeight.w800,
+              ),
             ),
-          ),
 
-          const SizedBox(height: 10),
+            const SizedBox(height: 10),
 
-          _mutedText(
-            'Create the learning structure your academy will use.',
-            fontSize: 14,
-          ),
-
-          const SizedBox(height: 24),
-
-          _buildGlassCard(
-            child: Column(
-              children: [
-                _buildProgressRow(
-                  number: '01',
-                  title: 'English Levels',
-                  description:
-                      'Define the levels your students can take.',
-                ),
-
-                const SizedBox(height: 14),
-
-                _buildProgressRow(
-                  number: '02',
-                  title: 'Courses',
-                  description:
-                      'Organize your academy into courses.',
-                ),
-
-                const SizedBox(height: 14),
-
-                _buildProgressRow(
-                  number: '03',
-                  title: 'Classes',
-                  description:
-                      'Create the classes that deliver each course.',
-                ),
-              ],
+            _mutedText(
+              'Create the learning structure your academy will use.',
+              fontSize: 14,
             ),
-          ),
 
-          const SizedBox(height: 26),
+            const SizedBox(height: 24),
 
-          _buildPrimaryButton(
-            label: _buttonLabel,
-            icon: Icons.arrow_forward_rounded,
-            onPressed: _next,
-          ),
-        ],
+            if (_structure.busy) const LinearProgressIndicator(),
+            if (_structure.error != null)
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: Text(
+                  _structure.error!,
+                  style: const TextStyle(color: Colors.amberAccent),
+                ),
+              ),
+            if (_structure.error != null &&
+                _structure.loaded &&
+                !_structure.busy)
+              TextButton(
+                onPressed: () async {
+                  final discard = await showDialog<bool>(
+                    context: context,
+                    builder: (context) => AlertDialog(
+                      title: const Text('Reload saved structure?'),
+                      content: const Text(
+                        'This discards your unsaved draft only after the saved structure loads successfully.',
+                      ),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.pop(context, false),
+                          child: const Text('Keep draft'),
+                        ),
+                        TextButton(
+                          onPressed: () => Navigator.pop(context, true),
+                          child: const Text('Reload'),
+                        ),
+                      ],
+                    ),
+                  );
+                  if (discard == true && mounted && _institutionId != null) {
+                    await _structure.load(
+                      SupabaseService.client,
+                      _institutionId!,
+                      discardConfirmed: true,
+                    );
+                  }
+                },
+                child: const Text('Reload saved version…'),
+              ),
+            if (!_structure.loaded && !_structure.busy)
+              TextButton(
+                onPressed: () {
+                  if (_institutionId != null)
+                    _structure.load(SupabaseService.client, _institutionId!);
+                },
+                child: const Text('Retry loading structure'),
+              ),
+            if (_structure.loaded)
+              AbsorbPointer(
+                absorbing: _structure.busy,
+                child: _buildGlassCard(
+                  child: Column(
+                    children: [
+                      _buildProgressRow(
+                        number: '01',
+                        title: 'English Levels',
+                        description:
+                            'Define the levels your students can take.',
+                      ),
+
+                      const SizedBox(height: 16),
+                      EnglishLevelsEditor(
+                        draft: _englishLevelsDraft,
+                        connected: true,
+                      ),
+
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 24),
+                        child: Divider(color: Color(0x336D67BA), height: 1),
+                      ),
+
+                      _buildProgressRow(
+                        number: '02',
+                        title: 'Courses',
+                        description: 'Organize your academy into courses.',
+                      ),
+
+                      const SizedBox(height: 16),
+                      CoursesEditor(draft: _coursesDraft, connected: true),
+
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 24),
+                        child: Divider(color: Color(0x336D67BA), height: 1),
+                      ),
+
+                      _buildProgressRow(
+                        number: '03',
+                        title: 'Classes',
+                        description:
+                            'Create the classes that deliver each course.',
+                      ),
+                      const SizedBox(height: 16),
+                      ClassesEditor(draft: _structure),
+                    ],
+                  ),
+                ),
+              ),
+
+            const SizedBox(height: 26),
+
+            _buildPrimaryButton(
+              label: _buttonLabel,
+              icon: Icons.arrow_forward_rounded,
+              onPressed: _next,
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1803,41 +1944,6 @@ Future<void> _loadInstitution() async {
   // ==========================================================
 
   Widget _buildTools() {
-    final tools = <List<dynamic>>[
-      [
-        Icons.people_alt_rounded,
-        'Students',
-      ],
-      [
-        Icons.school_rounded,
-        'Teachers',
-      ],
-      [
-        Icons.menu_book_rounded,
-        'Courses',
-      ],
-      [
-        Icons.class_rounded,
-        'Classes',
-      ],
-      [
-        Icons.emoji_events_rounded,
-        'Rankings',
-      ],
-      [
-        Icons.payments_rounded,
-        'Finance',
-      ],
-      [
-        Icons.analytics_rounded,
-        'Analytics',
-      ],
-      [
-        Icons.verified_user_rounded,
-        'Access Requests',
-      ],
-    ];
-
     return _contentShell(
       maxWidth: 920,
       child: Column(
@@ -1862,20 +1968,7 @@ Future<void> _loadInstitution() async {
 
           const SizedBox(height: 24),
 
-          _buildGlassCard(
-            child: Wrap(
-              alignment: WrapAlignment.center,
-              spacing: 10,
-              runSpacing: 10,
-              children: [
-                for (final tool in tools)
-                  _buildToolCard(
-                    tool[0] as IconData,
-                    tool[1] as String,
-                  ),
-              ],
-            ),
-          ),
+          _buildGlassCard(child: const NaosToolsShowcase()),
 
           const SizedBox(height: 26),
 
@@ -1895,13 +1988,11 @@ Future<void> _loadInstitution() async {
 
   Widget _buildMakeItYours() {
     return _contentShell(
-      maxWidth: 820,
+      maxWidth: 1120,
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          _buildNaosLogo(
-            size: 70,
-          ),
+          _buildNaosLogo(size: 70),
 
           const SizedBox(height: 14),
 
@@ -1924,48 +2015,51 @@ Future<void> _loadInstitution() async {
 
           const SizedBox(height: 24),
 
-          _buildGlassCard(
-            child: Column(
-              children: [
-                _buildChoiceRow(
-                  Icons.dashboard_customize_rounded,
-                  'Template',
-                  'Choose the structure that fits your school.',
-                ),
-
-                const SizedBox(height: 12),
-
-                _buildChoiceRow(
-                  Icons.palette_outlined,
-                  'Colors',
-                  'Choose your academy’s visual identity.',
-                ),
-
-                const SizedBox(height: 12),
-
-                _buildChoiceRow(
-                  Icons.text_fields_rounded,
-                  'Typography',
-                  'Choose how your school communicates.',
-                ),
-
-                const SizedBox(height: 12),
-
-                _buildChoiceRow(
-                  Icons.smart_button_outlined,
-                  'Button style',
-                  'Choose the interaction style for your interface.',
-                ),
-              ],
+          AbsorbPointer(
+            absorbing: _pendingAppearanceRequest != null,
+            child: InstitutionBrandEditor(
+              draft: _brandDraft,
+              institutionName: _schoolNameController.text,
+              logoBytes: _selectedLogoBytes,
+              logoUrl: _savedLogoUrl,
             ),
           ),
 
           const SizedBox(height: 26),
 
+          if (_finishSetupError != null) ...[
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: const Color(0x33FF6B7A),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: const Color(0x99FF8792)),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.error_outline, color: Color(0xFFFFB4BA)),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      _finishSetupError!,
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _savingSetup ? null : _finish,
+                    child: const Text('Retry'),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 18),
+          ],
+
           _buildPrimaryButton(
-            label: _buttonLabel,
+            label: _savingSetup ? 'Saving your school…' : _buttonLabel,
             icon: Icons.check_rounded,
-            onPressed: _next,
+            onPressed: _savingSetup ? null : _next,
           ),
         ],
       ),
@@ -1982,9 +2076,7 @@ Future<void> _loadInstitution() async {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          _buildNaosLogo(
-            size: 104,
-          ),
+          _buildNaosLogo(size: 104),
 
           const SizedBox(height: 22),
 
@@ -2060,23 +2152,13 @@ Future<void> _loadInstitution() async {
   // SHARED CONTENT
   // ==========================================================
 
-  Widget _contentShell({
-    required double maxWidth,
-    required Widget child,
-  }) {
+  Widget _contentShell({required double maxWidth, required Widget child}) {
     return Center(
       child: SingleChildScrollView(
         physics: const BouncingScrollPhysics(),
-        padding: const EdgeInsets.fromLTRB(
-          24,
-          58,
-          24,
-          84,
-        ),
+        padding: const EdgeInsets.fromLTRB(24, 58, 24, 84),
         child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxWidth: maxWidth,
-          ),
+          constraints: BoxConstraints(maxWidth: maxWidth),
           child: child,
         ),
       ),
@@ -2099,9 +2181,7 @@ Future<void> _loadInstitution() async {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          _buildNaosLogo(
-            size: 70,
-          ),
+          _buildNaosLogo(size: 70),
 
           const SizedBox(height: 16),
 
@@ -2132,16 +2212,11 @@ Future<void> _loadInstitution() async {
 
           const SizedBox(height: 10),
 
-          _mutedText(
-            subtitle,
-            fontSize: 14,
-          ),
+          _mutedText(subtitle, fontSize: 14),
 
           const SizedBox(height: 24),
 
-          _buildGlassCard(
-            child: child,
-          ),
+          _buildGlassCard(child: child),
 
           const SizedBox(height: 24),
 
@@ -2159,36 +2234,25 @@ Future<void> _loadInstitution() async {
   // NAOS LOGO
   // ==========================================================
 
-  Widget _buildNaosLogo({
-    double size = 82,
-  }) {
+  Widget _buildNaosLogo({double size = 82}) {
     return Container(
       width: size,
       height: size,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
         gradient: const RadialGradient(
-          colors: [
-            Color(0xFF8B82FF),
-            Color(0xFF5147D9),
-            Color(0xFF24225D),
-          ],
+          colors: [Color(0xFF8B82FF), Color(0xFF5147D9), Color(0xFF24225D)],
         ),
         boxShadow: [
           BoxShadow(
-            color: const Color(0xFF6860FF)
-                .withOpacity(0.40),
+            color: const Color(0xFF6860FF).withOpacity(0.40),
             blurRadius: size * 0.55,
             spreadRadius: size * 0.05,
           ),
         ],
       ),
       child: const Center(
-        child: Icon(
-          Icons.auto_awesome_rounded,
-          color: Colors.white,
-          size: 32,
-        ),
+        child: Icon(Icons.auto_awesome_rounded, color: Colors.white, size: 32),
       ),
     );
   }
@@ -2197,19 +2261,14 @@ Future<void> _loadInstitution() async {
   // GLASS CARD
   // ==========================================================
 
-  Widget _buildGlassCard({
-    required Widget child,
-  }) {
+  Widget _buildGlassCard({required Widget child}) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(22),
       decoration: BoxDecoration(
         color: const Color(0xCC080F2E),
         borderRadius: BorderRadius.circular(24),
-        border: Border.all(
-          color: const Color(0xFF5B65D9)
-              .withOpacity(0.38),
-        ),
+        border: Border.all(color: const Color(0xFF5B65D9).withOpacity(0.38)),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withOpacity(0.22),
@@ -2241,15 +2300,10 @@ Future<void> _loadInstitution() async {
               color: const Color(0xFF242A68),
               shape: BoxShape.circle,
               border: Border.all(
-                color: const Color(0xFF6C73FF)
-                    .withOpacity(0.5),
+                color: const Color(0xFF6C73FF).withOpacity(0.5),
               ),
             ),
-            child: Icon(
-              icon,
-              color: const Color(0xFFB9BFFF),
-              size: 26,
-            ),
+            child: Icon(icon, color: const Color(0xFFB9BFFF), size: 26),
           ),
 
           const SizedBox(height: 16),
@@ -2284,11 +2338,7 @@ Future<void> _loadInstitution() async {
   // CONCEPT
   // ==========================================================
 
-  Widget _buildConcept(
-    IconData icon,
-    String title,
-    String description,
-  ) {
+  Widget _buildConcept(IconData icon, String title, String description) {
     return Row(
       children: [
         _buildSmallIcon(icon),
@@ -2297,8 +2347,7 @@ Future<void> _loadInstitution() async {
 
         Expanded(
           child: Column(
-            crossAxisAlignment:
-                CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
                 title,
@@ -2313,10 +2362,7 @@ Future<void> _loadInstitution() async {
 
               Text(
                 description,
-                style: const TextStyle(
-                  color: Colors.white54,
-                  fontSize: 12,
-                ),
+                style: const TextStyle(color: Colors.white54, fontSize: 12),
               ),
             ],
           ),
@@ -2335,8 +2381,7 @@ Future<void> _loadInstitution() async {
     required String description,
   }) {
     return Row(
-      crossAxisAlignment:
-          CrossAxisAlignment.center,
+      crossAxisAlignment: CrossAxisAlignment.center,
       children: [
         Container(
           width: 46,
@@ -2345,8 +2390,7 @@ Future<void> _loadInstitution() async {
             shape: BoxShape.circle,
             color: const Color(0xFF1B245A),
             border: Border.all(
-              color: const Color(0xFF6972FF)
-                  .withOpacity(0.45),
+              color: const Color(0xFF6972FF).withOpacity(0.45),
             ),
           ),
           child: Center(
@@ -2365,8 +2409,7 @@ Future<void> _loadInstitution() async {
 
         Expanded(
           child: Column(
-            crossAxisAlignment:
-                CrossAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
                 title,
@@ -2381,10 +2424,7 @@ Future<void> _loadInstitution() async {
 
               Text(
                 description,
-                style: const TextStyle(
-                  color: Colors.white54,
-                  fontSize: 12,
-                ),
+                style: const TextStyle(color: Colors.white54, fontSize: 12),
               ),
             ],
           ),
@@ -2394,97 +2434,22 @@ Future<void> _loadInstitution() async {
   }
 
   // ==========================================================
-  // CHOICE ROW
-  // ==========================================================
-
-  Widget _buildChoiceRow(
-    IconData icon,
-    String title,
-    String description,
-  ) {
-    return Container(
-      padding: const EdgeInsets.symmetric(
-        horizontal: 14,
-        vertical: 12,
-      ),
-      decoration: BoxDecoration(
-        color: const Color(0x66131B46),
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: const Color(0xFF3B4488)
-              .withOpacity(0.45),
-        ),
-      ),
-      child: Row(
-        children: [
-          _buildSmallIcon(icon),
-
-          const SizedBox(width: 14),
-
-          Expanded(
-            child: Column(
-              crossAxisAlignment:
-                  CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 14,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-
-                const SizedBox(height: 3),
-
-                Text(
-                  description,
-                  style: const TextStyle(
-                    color: Colors.white54,
-                    fontSize: 12,
-                  ),
-                ),
-              ],
-            ),
-          ),
-
-          const Icon(
-            Icons.chevron_right_rounded,
-            color: Colors.white38,
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ==========================================================
   // TOOL CARD
   // ==========================================================
 
-  Widget _buildToolCard(
-    IconData icon,
-    String title,
-  ) {
+  Widget _buildToolCard(IconData icon, String title) {
     return Container(
       width: 190,
       height: 64,
-      padding: const EdgeInsets.symmetric(
-        horizontal: 14,
-      ),
+      padding: const EdgeInsets.symmetric(horizontal: 14),
       decoration: BoxDecoration(
         color: const Color(0x66131B46),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: const Color(0xFF3B4488)
-              .withOpacity(0.45),
-        ),
+        border: Border.all(color: const Color(0xFF3B4488).withOpacity(0.45)),
       ),
       child: Row(
         children: [
-          _buildSmallIcon(
-            icon,
-            size: 40,
-          ),
+          _buildSmallIcon(icon, size: 40),
 
           const SizedBox(width: 10),
 
@@ -2526,17 +2491,9 @@ Future<void> _loadInstitution() async {
       decoration: InputDecoration(
         labelText: label,
         hintText: hint,
-        labelStyle: const TextStyle(
-          color: Color(0xFF9EA5D6),
-        ),
-        hintStyle: const TextStyle(
-          color: Colors.white24,
-        ),
-        prefixIcon: Icon(
-          icon,
-          color: const Color(0xFF9FA7FF),
-          size: 21,
-        ),
+        labelStyle: const TextStyle(color: Color(0xFF9EA5D6)),
+        hintStyle: const TextStyle(color: Colors.white24),
+        prefixIcon: Icon(icon, color: const Color(0xFF9FA7FF), size: 21),
         filled: true,
         fillColor: const Color(0x6610183C),
         contentPadding: const EdgeInsets.symmetric(
@@ -2546,23 +2503,18 @@ Future<void> _loadInstitution() async {
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(16),
           borderSide: BorderSide(
-            color: const Color(0xFF3C478B)
-                .withOpacity(0.5),
+            color: const Color(0xFF3C478B).withOpacity(0.5),
           ),
         ),
         enabledBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(16),
           borderSide: BorderSide(
-            color: const Color(0xFF3C478B)
-                .withOpacity(0.5),
+            color: const Color(0xFF3C478B).withOpacity(0.5),
           ),
         ),
         focusedBorder: OutlineInputBorder(
           borderRadius: BorderRadius.circular(16),
-          borderSide: const BorderSide(
-            color: Color(0xFF747BFF),
-            width: 1.4,
-          ),
+          borderSide: const BorderSide(color: Color(0xFF747BFF), width: 1.4),
         ),
       ),
     );
@@ -2572,31 +2524,18 @@ Future<void> _loadInstitution() async {
   // PILL
   // ==========================================================
 
-  Widget _buildPill(
-    IconData icon,
-    String label,
-  ) {
+  Widget _buildPill(IconData icon, String label) {
     return Container(
-      padding: const EdgeInsets.symmetric(
-        horizontal: 13,
-        vertical: 9,
-      ),
+      padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
       decoration: BoxDecoration(
         color: const Color(0x66151E4C),
         borderRadius: BorderRadius.circular(30),
-        border: Border.all(
-          color: const Color(0xFF414B92)
-              .withOpacity(0.55),
-        ),
+        border: Border.all(color: const Color(0xFF414B92).withOpacity(0.55)),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(
-            icon,
-            color: const Color(0xFFABB1FF),
-            size: 17,
-          ),
+          Icon(icon, color: const Color(0xFFABB1FF), size: 17),
 
           const SizedBox(width: 7),
 
@@ -2623,26 +2562,16 @@ Future<void> _loadInstitution() async {
     required String description,
   }) {
     return Container(
-      padding: const EdgeInsets.symmetric(
-        horizontal: 12,
-        vertical: 13,
-      ),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 13),
       decoration: BoxDecoration(
-        color: const Color(0xFF11183B)
-            .withOpacity(0.45),
+        color: const Color(0xFF11183B).withOpacity(0.45),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(
-          color: const Color(0xFF6975E8)
-              .withOpacity(0.16),
-        ),
+        border: Border.all(color: const Color(0xFF6975E8).withOpacity(0.16)),
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          _buildSmallIcon(
-            icon,
-            size: 42,
-          ),
+          _buildSmallIcon(icon, size: 42),
 
           const SizedBox(height: 9),
 
@@ -2676,26 +2605,16 @@ Future<void> _loadInstitution() async {
   // SMALL ICON
   // ==========================================================
 
-  Widget _buildSmallIcon(
-    IconData icon, {
-    double size = 44,
-  }) {
+  Widget _buildSmallIcon(IconData icon, {double size = 44}) {
     return Container(
       width: size,
       height: size,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
         color: const Color(0xFF202960),
-        border: Border.all(
-          color: const Color(0xFF6570D8)
-              .withOpacity(0.4),
-        ),
+        border: Border.all(color: const Color(0xFF6570D8).withOpacity(0.4)),
       ),
-      child: Icon(
-        icon,
-        color: const Color(0xFFB5BBFF),
-        size: size * 0.48,
-      ),
+      child: Icon(icon, color: const Color(0xFFB5BBFF), size: size * 0.48),
     );
   }
 
@@ -2706,7 +2625,7 @@ Future<void> _loadInstitution() async {
   Widget _buildPrimaryButton({
     required String label,
     required IconData icon,
-    required VoidCallback onPressed,
+    required VoidCallback? onPressed,
   }) {
     return Material(
       color: Colors.transparent,
@@ -2721,23 +2640,18 @@ Future<void> _loadInstitution() async {
             gradient: const LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: [
-                Color(0xFF8077FF),
-                Color(0xFF5B58FF),
-              ],
+              colors: [Color(0xFF8077FF), Color(0xFF5B58FF)],
             ),
             boxShadow: [
               BoxShadow(
-                color: const Color(0xFF665FFF)
-                    .withOpacity(0.35),
+                color: const Color(0xFF665FFF).withOpacity(0.35),
                 blurRadius: 26,
                 spreadRadius: 1,
               ),
             ],
           ),
           child: Row(
-            mainAxisAlignment:
-                MainAxisAlignment.center,
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
               Text(
                 label,
@@ -2750,11 +2664,7 @@ Future<void> _loadInstitution() async {
 
               const SizedBox(width: 12),
 
-              Icon(
-                icon,
-                color: Colors.white,
-                size: 21,
-              ),
+              Icon(icon, color: Colors.white, size: 21),
             ],
           ),
         ),
@@ -2773,26 +2683,18 @@ Future<void> _loadInstitution() async {
         onTap: _back,
         borderRadius: BorderRadius.circular(14),
         child: Ink(
-          padding: const EdgeInsets.symmetric(
-            horizontal: 13,
-            vertical: 10,
-          ),
+          padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
           decoration: BoxDecoration(
             color: const Color(0xAA0A1130),
             borderRadius: BorderRadius.circular(14),
             border: Border.all(
-              color: const Color(0xFF414B92)
-                  .withOpacity(0.55),
+              color: const Color(0xFF414B92).withOpacity(0.55),
             ),
           ),
           child: const Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(
-                Icons.arrow_back_rounded,
-                color: Colors.white70,
-                size: 18,
-              ),
+              Icon(Icons.arrow_back_rounded, color: Colors.white70, size: 18),
 
               SizedBox(width: 6),
 
@@ -2820,27 +2722,20 @@ Future<void> _loadInstitution() async {
       mainAxisSize: MainAxisSize.min,
       children: [
         Row(
-          mainAxisAlignment:
-              MainAxisAlignment.center,
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            for (int i = 0; i <= _lastStep; i++) ...[
+            for (final i in _visibleSteps) ...[
               AnimatedContainer(
-                duration: const Duration(
-                  milliseconds: 220,
-                ),
+                duration: const Duration(milliseconds: 220),
                 width: i == _step ? 22 : 6,
                 height: 6,
                 decoration: BoxDecoration(
-                  color: i == _step
-                      ? const Color(0xFF8077FF)
-                      : Colors.white24,
-                  borderRadius:
-                      BorderRadius.circular(20),
+                  color: i == _step ? const Color(0xFF8077FF) : Colors.white24,
+                  borderRadius: BorderRadius.circular(20),
                 ),
               ),
 
-              if (i != _lastStep)
-                const SizedBox(width: 6),
+              if (i != _lastStep) const SizedBox(width: 6),
             ],
           ],
         ),
@@ -2848,7 +2743,7 @@ Future<void> _loadInstitution() async {
         const SizedBox(height: 7),
 
         Text(
-          'Step ${_step + 1} of ${_lastStep + 1}',
+          'Step ${_visibleSteps.indexOf(_step) + 1} of ${_visibleSteps.length}',
           style: const TextStyle(
             color: Colors.white38,
             fontSize: 10,
@@ -2886,11 +2781,14 @@ Future<void> _loadInstitution() async {
 
   @override
   void dispose() {
+    _appearanceAssetGateway?.close();
+    _structure.dispose();
+    _brandDraft.dispose();
+    _englishLevelsDraft.dispose();
+    _coursesDraft.dispose();
     _schoolNameSaveTimer?.cancel();
 
-    _schoolNameController.removeListener(
-      _onSchoolNameChanged,
-    );
+    _schoolNameController.removeListener(_onSchoolNameChanged);
 
     _contentController.dispose();
 

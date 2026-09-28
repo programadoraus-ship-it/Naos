@@ -1,0 +1,87 @@
+name: app
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.12.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Icons
+  cupertino_icons: ^1.0.8
+
+  # Supabase
+  supabase_flutter: ^2.17.1
+  image_picker: ^1.1.2
+  http: ^1.5.0
+  shared_preferences: ^2.5.3
+  path: ^1.9.1
+  path_provider: ^2.1.5
+  idb_shim: ^2.9.9
+
+  # Lottie animations
+  lottie: ^3.5.1
+
+  # Flame game engine
+  flame: ^1.38.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  fonts:
+    - family: Inter
+      fonts:
+        - asset: assets/fonts/Inter-Variable.ttf
+    - family: Lora
+      fonts:
+        - asset: assets/fonts/Lora-Variable.ttf
+    - family: Space Mono
+      fonts:
+        - asset: assets/fonts/SpaceMono-Regular.ttf
+        - asset: assets/fonts/SpaceMono-Bold.ttf
+          weight: 700
+    - family: Nunito
+      fonts:
+        - asset: assets/fonts/Nunito-Variable.ttf
+    - family: Fredoka
+      fonts:
+        - asset: assets/fonts/Fredoka-Variable.ttf
+    - family: Playfair Display
+      fonts:
+        - asset: assets/fonts/PlayfairDisplay-Variable.ttf
+    - family: Poppins
+      fonts:
+        - asset: assets/fonts/Poppins-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Poppins-Bold.ttf
+          weight: 700
+    - family: Quicksand
+      fonts:
+        - asset: assets/fonts/Quicksand-Variable.ttf
+    - family: Montserrat
+      fonts:
+        - asset: assets/fonts/Montserrat-Variable.ttf
+    - family: Bitter
+      fonts:
+        - asset: assets/fonts/Bitter-Variable.ttf
+
+  assets:
+    - assets/animations/
+    - assets/ambience/ocean/
+    - assets/ambience/space/
+    - assets/ambience/animals/
+    - assets/ambience/nature/
+    - assets/ambience/fantasy/
+
+  shaders:
+    - shaders/naos_nebula.frag
